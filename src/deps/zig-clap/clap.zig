@@ -17,6 +17,8 @@ test "clap" {
 pub const ComptimeClap = @import("clap/comptime.zig").ComptimeClap;
 pub const StreamingClap = @import("clap/streaming.zig").StreamingClap;
 
+pub const default_assignment_separators = "=";
+
 /// The names a ::Param can have.
 pub const Names = struct {
     /// '-' prefix
