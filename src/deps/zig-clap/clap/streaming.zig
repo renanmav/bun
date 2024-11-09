@@ -12,10 +12,10 @@ const mem = std.mem;
 const os = std.os;
 const testing = std.testing;
 
-// Disabled because not all CLI arguments are parsed with Clap.
+// Disabled because not all CLI arguments are parsed with StreamingClap.
 pub var warn_on_unrecognized_flag = false;
 
-/// The result returned from Clap.next
+/// The result returned from StreamingClap.next
 pub fn Arg(comptime Id: type) type {
     return struct {
         const Self = @This();
@@ -32,11 +32,11 @@ pub const Error = error{
 };
 
 /// A command line argument parser which, given an ArgIterator, will parse arguments according
-/// to the params. Clap parses in an iterating manner, so you have to use a loop together with
-/// Clap.next to parse all the arguments of your program.
+/// to the params. StreamingClap parses in an iterating manner, so you have to use a loop together with
+/// StreamingClap.next to parse all the arguments of your program.
 ///
 /// This parser is the building block for all the more complicated parsers.
-pub fn Clap(comptime Id: type, comptime ArgIterator: type) type {
+pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
     return struct {
         const State = union(enum) {
             normal,
@@ -224,7 +224,7 @@ pub fn Clap(comptime Id: type, comptime ArgIterator: type) type {
 }
 
 fn expectArgs(
-    parser: *Clap(u8, clap.args.SliceIterator),
+    parser: *StreamingClap(u8, clap.args.SliceIterator),
     results: []const Arg(u8),
 ) !void {
     for (results) |res| {
@@ -243,7 +243,7 @@ fn expectArgs(
 }
 
 fn expectError(
-    parser: *Clap(u8, clap.args.SliceIterator),
+    parser: *StreamingClap(u8, clap.args.SliceIterator),
     expected: []const u8,
 ) !void {
     var diag: clap.Diagnostic = .{};
@@ -286,7 +286,7 @@ test "short params" {
         "-c", "0",     "-c=0", "-ac",
         "0",  "-ac=0", "-d=0",
     } };
-    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    var parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
 
     try expectArgs(&parser, &.{
         .{ .param = a },
@@ -331,7 +331,7 @@ test "long params" {
         "--cc",   "0",
         "--cc=0", "--dd=0",
     } };
-    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    var parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
 
     try expectArgs(&parser, &.{
         .{ .param = aa },
@@ -352,7 +352,7 @@ test "positional params" {
         "aa",
         "bb",
     } };
-    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    var parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
 
     try expectArgs(&parser, &.{
         .{ .param = &params[0], .value = "aa" },
@@ -390,7 +390,7 @@ test "all params" {
         "--cc", "0",     "--cc=0", "something",
         "-",    "--",    "--cc=0", "-a",
     } };
-    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    var parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
 
     try expectArgs(&parser, &.{
         .{ .param = aa },
@@ -431,7 +431,7 @@ test "different assignment separators" {
         "-a=0", "--aa=0",
         "-a:0", "--aa:0",
     } };
-    var parser = Clap(u8, clap.args.SliceIterator){
+    var parser = StreamingClap(u8, clap.args.SliceIterator){
         .params = &params,
         .iter = &iter,
         .assignment_separators = "=:",
@@ -459,34 +459,34 @@ test "errors" {
     };
 
     var iter = clap.args.SliceIterator{ .args = &.{"q"} };
-    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    var parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "Invalid argument 'q'\n");
 
     iter = clap.args.SliceIterator{ .args = &.{"-q"} };
-    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "Invalid argument '-q'\n");
 
     iter = clap.args.SliceIterator{ .args = &.{"--q"} };
-    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "Invalid argument '--q'\n");
 
     iter = clap.args.SliceIterator{ .args = &.{"--q=1"} };
-    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "Invalid argument '--q'\n");
 
     iter = clap.args.SliceIterator{ .args = &.{"-a=1"} };
-    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "The argument '-a' does not take a value\n");
 
     iter = clap.args.SliceIterator{ .args = &.{"--aa=1"} };
-    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "The argument '--aa' does not take a value\n");
 
     iter = clap.args.SliceIterator{ .args = &.{"-c"} };
-    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "The argument '-c' requires a value but none was supplied\n");
 
     iter = clap.args.SliceIterator{ .args = &.{"--cc"} };
-    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    parser = StreamingClap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
     try expectError(&parser, "The argument '--cc' requires a value but none was supplied\n");
 }
