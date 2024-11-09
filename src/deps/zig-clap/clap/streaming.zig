@@ -15,7 +15,7 @@ const testing = std.testing;
 // Disabled because not all CLI arguments are parsed with Clap.
 pub var warn_on_unrecognized_flag = false;
 
-/// The result returned from StreamingClap.next
+/// The result returned from Clap.next
 pub fn Arg(comptime Id: type) type {
     return struct {
         const Self = @This();
@@ -25,10 +25,18 @@ pub fn Arg(comptime Id: type) type {
     };
 }
 
+pub const Error = error{
+    MissingValue,
+    InvalidArgument,
+    DoesntTakeValue,
+};
+
 /// A command line argument parser which, given an ArgIterator, will parse arguments according
-/// to the params. StreamingClap parses in an iterating manner, so you have to use a loop together with
-/// StreamingClap.next to parse all the arguments of your program.
-pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
+/// to the params. Clap parses in an iterating manner, so you have to use a loop together with
+/// Clap.next to parse all the arguments of your program.
+///
+/// This parser is the building block for all the more complicated parsers.
+pub fn Clap(comptime Id: type, comptime ArgIterator: type) type {
     return struct {
         const State = union(enum) {
             normal,
@@ -41,19 +49,20 @@ pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
             };
         };
 
-        const ArgError = error{ DoesntTakeValue, MissingValue, InvalidArgument };
+        state: State = .normal,
 
         params: []const clap.Param(Id),
         iter: *ArgIterator,
-        state: State = .normal,
+
         positional: ?*const clap.Param(Id) = null,
         diagnostic: ?*clap.Diagnostic = null,
+        assignment_separators: []const u8 = clap.default_assignment_separators,
 
         /// Get the next Arg that matches a Param.
-        pub fn next(parser: *@This()) ArgError!?Arg(Id) {
+        pub fn next(parser: *@This()) !?Arg(Id) {
             switch (parser.state) {
                 .normal => return try parser.normal(),
-                .chaining => |state| return try parser.chainging(state),
+                .chaining => |state| return try parser.chaining(state),
                 .rest_are_positional => {
                     const param = parser.positionalParam() orelse unreachable;
                     const value = parser.iter.next() orelse return null;
@@ -62,63 +71,41 @@ pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
             }
         }
 
-        fn normal(parser: *@This()) ArgError!?Arg(Id) {
-            const ArgType = Arg(Id);
+        fn normal(parser: *@This()) !?Arg(Id) {
             const arg_info = (try parser.parseNextArg()) orelse return null;
             const arg = arg_info.arg;
-
             switch (arg_info.kind) {
                 .long => {
-                    const eql_index = mem.indexOfScalar(u8, arg, '=');
+                    const eql_index = std.mem.indexOfAny(u8, arg, parser.assignment_separators);
                     const name = if (eql_index) |i| arg[0..i] else arg;
-
                     const maybe_value = if (eql_index) |i| arg[i + 1 ..] else null;
 
                     for (parser.params) |*param| {
                         const match = param.names.long orelse continue;
 
-                        if (!mem.eql(u8, name, match))
+                        if (!std.mem.eql(u8, name, match))
                             continue;
+                        if (param.takes_value == .none) {
+                            if (maybe_value != null)
+                                return parser.err(arg, .{ .long = name }, Error.DoesntTakeValue);
 
-                        if (param.takes_value == .none or param.takes_value == .one_optional) {
-                            if (param.takes_value == .none and maybe_value != null) {
-                                return parser.err(arg, .{ .long = name }, error.DoesntTakeValue);
-                            }
-
-                            return ArgType{ .param = param, .value = maybe_value };
+                            return Arg(Id){ .param = param };
                         }
 
                         const value = blk: {
                             if (maybe_value) |v|
                                 break :blk v;
 
-                            break :blk parser.iter.next() orelse {
-                                return parser.err(arg, .{ .long = name }, error.MissingValue);
-                            };
+                            break :blk parser.iter.next() orelse
+                                return parser.err(arg, .{ .long = name }, Error.MissingValue);
                         };
 
-                        return ArgType{ .param = param, .value = value };
+                        return Arg(Id){ .param = param, .value = value };
                     }
 
-                    // unrecognized command
-                    // if flag else arg
-                    if (arg_info.kind == .long or arg_info.kind == .short) {
-                        if (warn_on_unrecognized_flag) {
-                            Output.warn("unrecognized flag: {s}{s}\n", .{ if (arg_info.kind == .long) "--" else "-", name });
-                            Output.flush();
-                        }
-
-                        // continue parsing after unrecognized flag
-                        return parser.next();
-                    }
-
-                    if (warn_on_unrecognized_flag) {
-                        Output.warn("unrecognized argument: {s}\n", .{name});
-                        Output.flush();
-                    }
-                    return null;
+                    return parser.err(arg, .{ .long = name }, Error.InvalidArgument);
                 },
-                .short => return try parser.chainging(.{
+                .short => return try parser.chaining(.{
                     .arg = arg,
                     .index = 0,
                 }),
@@ -126,21 +113,20 @@ pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
                     // If we find a positional with the value `--` then we
                     // interpret the rest of the arguments as positional
                     // arguments.
-                    if (mem.eql(u8, arg, "--")) {
+                    if (std.mem.eql(u8, arg, "--")) {
                         parser.state = .rest_are_positional;
-                        // return null to terminate arg parsing
                         const value = parser.iter.next() orelse return null;
                         return Arg(Id){ .param = param, .value = value };
                     }
 
                     return Arg(Id){ .param = param, .value = arg };
                 } else {
-                    return parser.err(arg, .{}, error.InvalidArgument);
+                    return parser.err(arg, .{}, Error.InvalidArgument);
                 },
             }
         }
 
-        fn chainging(parser: *@This(), state: State.Chaining) ArgError!?Arg(Id) {
+        fn chaining(parser: *@This(), state: State.Chaining) !?Arg(Id) {
             const arg = state.arg;
             const index = state.index;
             const next_index = index + 1;
@@ -164,27 +150,31 @@ pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
                     }
                 }
 
-                const next_is_eql = if (next_index < arg.len) arg[next_index] == '=' else false;
-                if (param.takes_value == .none or param.takes_value == .one_optional) {
-                    if (next_is_eql and param.takes_value == .none)
-                        return parser.err(arg, .{ .short = short }, error.DoesntTakeValue);
+                const next_is_separator = if (next_index < arg.len)
+                    std.mem.indexOfScalar(u8, parser.assignment_separators, arg[next_index]) != null
+                else
+                    false;
+
+                if (param.takes_value == .none) {
+                    if (next_is_separator)
+                        return parser.err(arg, .{ .short = short }, Error.DoesntTakeValue);
                     return Arg(Id){ .param = param };
                 }
 
                 if (arg.len <= next_index) {
                     const value = parser.iter.next() orelse
-                        return parser.err(arg, .{ .short = short }, error.MissingValue);
+                        return parser.err(arg, .{ .short = short }, Error.MissingValue);
 
                     return Arg(Id){ .param = param, .value = value };
                 }
 
-                if (next_is_eql)
+                if (next_is_separator)
                     return Arg(Id){ .param = param, .value = arg[next_index + 1 ..] };
 
                 return Arg(Id){ .param = param, .value = arg[next_index..] };
             }
 
-            return parser.err(arg, .{ .short = arg[index] }, error.InvalidArgument);
+            return parser.err(arg, .{ .short = arg[index] }, Error.InvalidArgument);
         }
 
         fn positionalParam(parser: *@This()) ?*const clap.Param(Id) {
@@ -213,13 +203,13 @@ pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
             },
         };
 
-        fn parseNextArg(parser: *@This()) ArgError!?ArgInfo {
+        fn parseNextArg(parser: *@This()) !?ArgInfo {
             const full_arg = parser.iter.next() orelse return null;
-            if (mem.eql(u8, full_arg, "--") or mem.eql(u8, full_arg, "-"))
+            if (std.mem.eql(u8, full_arg, "--") or std.mem.eql(u8, full_arg, "-"))
                 return ArgInfo{ .arg = full_arg, .kind = .positional };
-            if (mem.startsWith(u8, full_arg, "--"))
+            if (std.mem.startsWith(u8, full_arg, "--"))
                 return ArgInfo{ .arg = full_arg[2..], .kind = .long };
-            if (mem.startsWith(u8, full_arg, "-"))
+            if (std.mem.startsWith(u8, full_arg, "-"))
                 return ArgInfo{ .arg = full_arg[1..], .kind = .short };
 
             return ArgInfo{ .arg = full_arg, .kind = .positional };
@@ -233,45 +223,41 @@ pub fn StreamingClap(comptime Id: type, comptime ArgIterator: type) type {
     };
 }
 
-fn testNoErr(params: []const clap.Param(u8), args_strings: []const []const u8, results: []const Arg(u8)) void {
-    var iter = args.SliceIterator{ .args = args_strings };
-    var c = StreamingClap(u8, args.SliceIterator){
-        .params = params,
-        .iter = &iter,
-    };
-
+fn expectArgs(
+    parser: *Clap(u8, clap.args.SliceIterator),
+    results: []const Arg(u8),
+) !void {
     for (results) |res| {
-        const arg = (c.next() catch unreachable) orelse unreachable;
-        testing.expectEqual(res.param, arg.param);
+        const arg = (try parser.next()) orelse return error.TestFailed;
+        try std.testing.expectEqual(res.param, arg.param);
         const expected_value = res.value orelse {
-            testing.expectEqual(@as(@TypeOf(arg.value), null), arg.value);
+            try std.testing.expectEqual(@as(@TypeOf(arg.value), null), arg.value);
             continue;
         };
-        const actual_value = arg.value orelse unreachable;
-        testing.expectEqualSlices(u8, expected_value, actual_value);
+        const actual_value = arg.value orelse return error.TestFailed;
+        try std.testing.expectEqualSlices(u8, expected_value, actual_value);
     }
 
-    if (c.next() catch unreachable) |_|
-        unreachable;
+    if (try parser.next()) |_|
+        return error.TestFailed;
 }
 
-fn testErr(params: []const clap.Param(u8), args_strings: []const []const u8, expected: []const u8) void {
-    var diag = clap.Diagnostic{};
-    var iter = args.SliceIterator{ .args = args_strings };
-    var c = StreamingClap(u8, args.SliceIterator){
-        .params = params,
-        .iter = &iter,
-        .diagnostic = &diag,
-    };
-    while (c.next() catch |err| {
+fn expectError(
+    parser: *Clap(u8, clap.args.SliceIterator),
+    expected: []const u8,
+) !void {
+    var diag: clap.Diagnostic = .{};
+    parser.diagnostic = &diag;
+
+    while (parser.next() catch |err| {
         var buf: [1024]u8 = undefined;
-        var fbs = io.fixedBufferStream(&buf);
-        diag.report(fbs.writer(), err) catch unreachable;
-        testing.expectEqualStrings(expected, fbs.getWritten());
+        var fbs = std.io.fixedBufferStream(&buf);
+        diag.report(fbs.writer(), err) catch return error.TestFailed;
+        try std.testing.expectEqualStrings(expected, fbs.getWritten());
         return;
     }) |_| {}
 
-    testing.expect(false);
+    try std.testing.expect(false);
 }
 
 test "short params" {
@@ -295,29 +281,28 @@ test "short params" {
     const c = &params[2];
     const d = &params[3];
 
-    testNoErr(
-        &params,
-        &[_][]const u8{
-            "-a", "-b",    "-ab",  "-ba",
-            "-c", "0",     "-c=0", "-ac",
-            "0",  "-ac=0", "-d=0",
-        },
-        &[_]Arg(u8){
-            .{ .param = a },
-            .{ .param = b },
-            .{ .param = a },
-            .{ .param = b },
-            .{ .param = b },
-            .{ .param = a },
-            .{ .param = c, .value = "0" },
-            .{ .param = c, .value = "0" },
-            .{ .param = a },
-            .{ .param = c, .value = "0" },
-            .{ .param = a },
-            .{ .param = c, .value = "0" },
-            .{ .param = d, .value = "0" },
-        },
-    );
+    var iter = clap.args.SliceIterator{ .args = &.{
+        "-a", "-b",    "-ab",  "-ba",
+        "-c", "0",     "-c=0", "-ac",
+        "0",  "-ac=0", "-d=0",
+    } };
+    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+
+    try expectArgs(&parser, &.{
+        .{ .param = a },
+        .{ .param = b },
+        .{ .param = a },
+        .{ .param = b },
+        .{ .param = b },
+        .{ .param = a },
+        .{ .param = c, .value = "0" },
+        .{ .param = c, .value = "0" },
+        .{ .param = a },
+        .{ .param = c, .value = "0" },
+        .{ .param = a },
+        .{ .param = c, .value = "0" },
+        .{ .param = d, .value = "0" },
+    });
 }
 
 test "long params" {
@@ -341,21 +326,20 @@ test "long params" {
     const cc = &params[2];
     const dd = &params[3];
 
-    testNoErr(
-        &params,
-        &[_][]const u8{
-            "--aa",   "--bb",
-            "--cc",   "0",
-            "--cc=0", "--dd=0",
-        },
-        &[_]Arg(u8){
-            .{ .param = aa },
-            .{ .param = bb },
-            .{ .param = cc, .value = "0" },
-            .{ .param = cc, .value = "0" },
-            .{ .param = dd, .value = "0" },
-        },
-    );
+    var iter = clap.args.SliceIterator{ .args = &.{
+        "--aa",   "--bb",
+        "--cc",   "0",
+        "--cc=0", "--dd=0",
+    } };
+    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+
+    try expectArgs(&parser, &.{
+        .{ .param = aa },
+        .{ .param = bb },
+        .{ .param = cc, .value = "0" },
+        .{ .param = cc, .value = "0" },
+        .{ .param = dd, .value = "0" },
+    });
 }
 
 test "positional params" {
@@ -364,14 +348,16 @@ test "positional params" {
         .takes_value = .one,
     }};
 
-    testNoErr(
-        &params,
-        &[_][]const u8{ "aa", "bb" },
-        &[_]Arg(u8){
-            .{ .param = &params[0], .value = "aa" },
-            .{ .param = &params[0], .value = "bb" },
-        },
-    );
+    var iter = clap.args.SliceIterator{ .args = &.{
+        "aa",
+        "bb",
+    } };
+    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+
+    try expectArgs(&parser, &.{
+        .{ .param = &params[0], .value = "aa" },
+        .{ .param = &params[0], .value = "bb" },
+    });
 }
 
 test "all params" {
@@ -397,38 +383,66 @@ test "all params" {
     const cc = &params[2];
     const positional = &params[3];
 
-    testNoErr(
-        &params,
-        &[_][]const u8{
-            "-a",   "-b",    "-ab",    "-ba",
-            "-c",   "0",     "-c=0",   "-ac",
-            "0",    "-ac=0", "--aa",   "--bb",
-            "--cc", "0",     "--cc=0", "something",
-            "-",    "--",    "--cc=0", "-a",
+    var iter = clap.args.SliceIterator{ .args = &.{
+        "-a",   "-b",    "-ab",    "-ba",
+        "-c",   "0",     "-c=0",   "-ac",
+        "0",    "-ac=0", "--aa",   "--bb",
+        "--cc", "0",     "--cc=0", "something",
+        "-",    "--",    "--cc=0", "-a",
+    } };
+    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+
+    try expectArgs(&parser, &.{
+        .{ .param = aa },
+        .{ .param = bb },
+        .{ .param = aa },
+        .{ .param = bb },
+        .{ .param = bb },
+        .{ .param = aa },
+        .{ .param = cc, .value = "0" },
+        .{ .param = cc, .value = "0" },
+        .{ .param = aa },
+        .{ .param = cc, .value = "0" },
+        .{ .param = aa },
+        .{ .param = cc, .value = "0" },
+        .{ .param = aa },
+        .{ .param = bb },
+        .{ .param = cc, .value = "0" },
+        .{ .param = cc, .value = "0" },
+        .{ .param = positional, .value = "something" },
+        .{ .param = positional, .value = "-" },
+        .{ .param = positional, .value = "--cc=0" },
+        .{ .param = positional, .value = "-a" },
+    });
+}
+
+test "different assignment separators" {
+    const params = [_]clap.Param(u8){
+        .{
+            .id = 0,
+            .names = .{ .short = 'a', .long = "aa" },
+            .takes_value = .one,
         },
-        &[_]Arg(u8){
-            .{ .param = aa },
-            .{ .param = bb },
-            .{ .param = aa },
-            .{ .param = bb },
-            .{ .param = bb },
-            .{ .param = aa },
-            .{ .param = cc, .value = "0" },
-            .{ .param = cc, .value = "0" },
-            .{ .param = aa },
-            .{ .param = cc, .value = "0" },
-            .{ .param = aa },
-            .{ .param = cc, .value = "0" },
-            .{ .param = aa },
-            .{ .param = bb },
-            .{ .param = cc, .value = "0" },
-            .{ .param = cc, .value = "0" },
-            .{ .param = positional, .value = "something" },
-            .{ .param = positional, .value = "-" },
-            .{ .param = positional, .value = "--cc=0" },
-            .{ .param = positional, .value = "-a" },
-        },
-    );
+    };
+
+    const aa = &params[0];
+
+    var iter = clap.args.SliceIterator{ .args = &.{
+        "-a=0", "--aa=0",
+        "-a:0", "--aa:0",
+    } };
+    var parser = Clap(u8, clap.args.SliceIterator){
+        .params = &params,
+        .iter = &iter,
+        .assignment_separators = "=:",
+    };
+
+    try expectArgs(&parser, &.{
+        .{ .param = aa, .value = "0" },
+        .{ .param = aa, .value = "0" },
+        .{ .param = aa, .value = "0" },
+        .{ .param = aa, .value = "0" },
+    });
 }
 
 test "errors" {
@@ -443,12 +457,36 @@ test "errors" {
             .takes_value = .one,
         },
     };
-    testErr(&params, &[_][]const u8{"q"}, "Invalid argument 'q'\n");
-    testErr(&params, &[_][]const u8{"-q"}, "Invalid argument '-q'\n");
-    testErr(&params, &[_][]const u8{"--q"}, "Invalid argument '--q'\n");
-    testErr(&params, &[_][]const u8{"--q=1"}, "Invalid argument '--q'\n");
-    testErr(&params, &[_][]const u8{"-a=1"}, "The argument '-a' does not take a value\n");
-    testErr(&params, &[_][]const u8{"--aa=1"}, "The argument '--aa' does not take a value\n");
-    testErr(&params, &[_][]const u8{"-c"}, "The argument '-c' requires a value but none was supplied\n");
-    testErr(&params, &[_][]const u8{"--cc"}, "The argument '--cc' requires a value but none was supplied\n");
+
+    var iter = clap.args.SliceIterator{ .args = &.{"q"} };
+    var parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "Invalid argument 'q'\n");
+
+    iter = clap.args.SliceIterator{ .args = &.{"-q"} };
+    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "Invalid argument '-q'\n");
+
+    iter = clap.args.SliceIterator{ .args = &.{"--q"} };
+    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "Invalid argument '--q'\n");
+
+    iter = clap.args.SliceIterator{ .args = &.{"--q=1"} };
+    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "Invalid argument '--q'\n");
+
+    iter = clap.args.SliceIterator{ .args = &.{"-a=1"} };
+    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "The argument '-a' does not take a value\n");
+
+    iter = clap.args.SliceIterator{ .args = &.{"--aa=1"} };
+    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "The argument '--aa' does not take a value\n");
+
+    iter = clap.args.SliceIterator{ .args = &.{"-c"} };
+    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "The argument '-c' requires a value but none was supplied\n");
+
+    iter = clap.args.SliceIterator{ .args = &.{"--cc"} };
+    parser = Clap(u8, clap.args.SliceIterator){ .params = &params, .iter = &iter };
+    try expectError(&parser, "The argument '--cc' requires a value but none was supplied\n");
 }
